@@ -18,7 +18,8 @@ def _init_model(model_dir, device, vad_model, vad_kwargs):
         remote_code="./model.py",
         vad_model=vad_model,
         vad_kwargs=vad_kwargs,
-        device=device
+        device=device,
+        disable_update=True
     )
 
 
@@ -86,6 +87,12 @@ class VoiceRecognizer:
                 self.text_buffer = self._decode(self.audio_buffer[:self.buffer_offset])
                 if self.text_buffer:
                     print(f"Transcription: {self.text_buffer}, Chunk Numbers: {self.chunk_num}", flush=True)
+                else:
+                    self.text_buffer = ""
+                    # 滚动缓冲区
+                    self.audio_buffer = np.roll(self.audio_buffer, -self.chunk_num * self.chunk_size)
+                    self.buffer_offset -= self.chunk_num * self.chunk_size
+                    self.chunk_num = 0
         else:
             if self.text_buffer:
                 self.buffer_clear_offset += frames

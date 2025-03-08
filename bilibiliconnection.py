@@ -1,56 +1,102 @@
 import asyncio
 import os
+import threading
 
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import blivedm
 import blivedm.models.open_live as open_models
 import blivedm.models.web as web_models
+from llmClient.llm_manager import LLMManager
 
 load_dotenv()
 
 
 class BilibiliClient:
+    ACCESS_KEY_ID = ""
+    ACCESS_KEY_SECRET = ""
+    APP_ID = ""
+    ROOM_OWNER_AUTH_CODE = ""
+    llm_manager = None
 
-    def __init__(self, access_key_id: str, access_key_secret: str, app_id: int, room_owner_id: str):
+    def __init__(self, access_key_id: str, access_key_secret: str, app_id: int, room_owner_id: str,
+                 llm_manager: LLMManager):
         self.client = None
         self.ACCESS_KEY_ID = access_key_id
         self.ACCESS_KEY_SECRET = access_key_secret
         self.APP_ID = app_id
         self.ROOM_OWNER_AUTH_CODE = room_owner_id
+        self.thread = None
+        self.loop = None
+        self.is_running = False
+        self.llm_manager = llm_manager
+
+    def start_client(self):
+        if self.is_running:
+            print("客户端已经在运行！")
+            return
+
+        self.is_running = True
+        self.thread = threading.Thread(target=self.run)
+        self.thread.start()
+        print("bilibili直播间连接开启")
+
+    async def stop_and_close_with_timeout(self, client, timeout=10):
+        try:
+            await asyncio.wait_for(client.stop_and_close(), timeout)
+        except asyncio.TimeoutError:
+            print("Warning: 关闭 WebSocket 连接超时，可能 Bilibili 服务器未响应")
+
+    def stop_client(self):
+        if not self.is_running:
+            print("客户端未运行！")
+            return
+
+        self.is_running = False
+        asyncio.run_coroutine_threadsafe(
+            self.stop_and_close_with_timeout(self.client, timeout=10), self.loop
+        )
+        self.thread.join()
+        print("bilibili直播间连接关闭")
 
     async def run_single_client(self):
         """
         演示监听一个直播间
         """
         self.client = blivedm.OpenLiveClient(
-            access_key_id=ACCESS_KEY_ID,
-            access_key_secret=ACCESS_KEY_SECRET,
-            app_id=APP_ID,
-            room_owner_auth_code=ROOM_OWNER_AUTH_CODE,
+            access_key_id=self.ACCESS_KEY_ID,
+            access_key_secret=self.ACCESS_KEY_SECRET,
+            app_id=self.APP_ID,
+            room_owner_auth_code=self.ROOM_OWNER_AUTH_CODE,
         )
-        handler = MyHandler()
+        handler = MyHandler(llm_manager=self.llm_manager)
         self.client.set_handler(handler)
-
+        print("Connection start...")
         self.client.start()
         try:
-            # 演示70秒后停止
-            # await asyncio.sleep(70)
-            # client.stop()
-
             await self.client.join()
         finally:
             await self.client.stop_and_close()
 
-    async def close_client(self):
-        await self.client.stop_and_close()
+    def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self.run_single_client())
 
 
 class MyHandler(blivedm.BaseHandler):
+    executor = ThreadPoolExecutor(max_workers=5)
+
+    def __init__(self, llm_manager: LLMManager):
+        self.llm_manager = llm_manager
+
     def _on_heartbeat(self, client: blivedm.BLiveClient, message: web_models.HeartbeatMessage):
         print(f'[{client.room_id}] 心跳')
 
     def _on_open_live_danmaku(self, client: blivedm.OpenLiveClient, message: open_models.DanmakuMessage):
         print(f'[{message.room_id}] {message.uname}：{message.msg}')
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(self.executor, self.llm_manager.call_llm, f"({message.uname} 说) {message.msg}")
 
     def _on_open_live_gift(self, client: blivedm.OpenLiveClient, message: open_models.GiftMessage):
         coin_type = '金瓜子' if message.paid else '银瓜子'
@@ -93,7 +139,9 @@ if __name__ == '__main__':
     # 主播身份码
     ROOM_OWNER_AUTH_CODE = os.environ.get("ROOM_OWNER_AUTH_CODE")
     client = BilibiliClient(ACCESS_KEY_ID, ACCESS_KEY_SECRET, APP_ID, ROOM_OWNER_AUTH_CODE)
-    asyncio.run(client.run_single_client())
+    client.start_client()
+    input("Press Enter to stop...")  # 主线程在此阻塞
+    client.stop_client()
 
 
 

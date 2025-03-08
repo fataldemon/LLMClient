@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import time
 
 from dao.status import get_status_description
 from functions.function_call import get_general_tools
@@ -54,6 +55,9 @@ def init_status() -> str:
 class LLMManager:
     llm: LLM = None
 
+    def __init__(self):
+        self.lock = False
+
     def start_llm(self, url: str, url_assistant: str, temperature: float = 0.94, top_p: float = 0.7, top_k: int = 20,
                   repetition_penalty: float = None, max_history: int = 20) -> LLM:
         self.llm = LocalLLMObject(
@@ -71,19 +75,22 @@ class LLMManager:
         self.llm = None
 
     def call_llm(self, prompt) -> str:
-        # 初始化工具类
-        tools = get_general_tools()
-        status = init_status()
         if self.llm is not None:
+            # 初始化工具类
+            tools = get_general_tools()
+            status = init_status()
+            while self.lock:
+                time.sleep(0.1)
+            self.lock = True
             thought, response, feedback, finish_reason, action_name = asyncio.run(
                 self.llm.call(
-                    f"（老师说）{prompt}",
+                    prompt,
                     embedding="",
                     status=status,
                     tools=tools
                 )
             )
+            self.lock = False
             return response
         else:
             return "..."
-

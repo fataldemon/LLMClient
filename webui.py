@@ -1,14 +1,21 @@
-import torch
+import asyncio
+import os
+import sys
+
+from dotenv import load_dotenv
+import sounddevice as sd
 import streamlit as st
+import torch
+from streamlit_autorefresh import st_autorefresh
 from streamlit_chat import message
 from streamlit_extras.let_it_rain import rain
-from streamlit_autorefresh import st_autorefresh
-import sounddevice as sd
-from stt.voice_recognizer import VoiceRecognizer
+from bilibiliconnection import BilibiliClient
+
 from llmClient.llm_manager import LLMManager
-import sys
-import asyncio
+from stt.voice_recognizer import VoiceRecognizer
 from utils.utils import remove_emotion, get_image_as_data_uri
+
+load_dotenv()
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -17,7 +24,7 @@ torch.classes.__path__ = []
 
 # 页面配置
 st.set_page_config(
-    page_title="高性能机器人助手-天童爱丽丝",
+    page_title="Momotalk-天童爱丽丝",
     page_icon="🤖",
     layout="wide"
 )
@@ -25,8 +32,8 @@ st.set_page_config(
 # 初始化session状态
 if 'bili_connected' not in st.session_state:
     st.session_state.bili_connected = False
-if 'bili_room_id' not in st.session_state:
-    st.session_state.bili_room_id = ""
+if 'bili_client' not in st.session_state:
+    st.session_state.bili_client = None
 # 初始化大模型实例
 if "llm_manager" not in st.session_state:
     st.session_state.llm_manager = LLMManager()
@@ -50,6 +57,9 @@ with st.sidebar:
         if st.session_state.llm_manager.llm is not None:
             st.session_state.llm_manager.llm.temperature = st.session_state.temperature
             st.session_state.llm_manager.llm.top_p = st.session_state.top_p
+            st.session_state.llm_manager.llm.top_k = st.session_state.top_k
+            st.session_state.llm_manager.llm.repetition_penalty = st.session_state.repetition_penalty
+            st.session_state.llm_manager.llm.max_history = st.session_state.max_history
 
 
     # 大模型配置模块
@@ -73,7 +83,7 @@ with st.sidebar:
             help="示例：http://localhost:8000/v1/assistant/completions"
         )
         temperature = st.slider(
-            "温度",
+            "temperature",
             0.00, 1.00, 0.94, 0.01,
             help="调整大模型温度参数",
             key="temperature",
@@ -84,6 +94,27 @@ with st.sidebar:
             0.00, 1.00, 0.6, 0.01,
             help="调整大模型top_p参数",
             key="top_p",
+            on_change=llm_slider_changed
+        )
+        top_k = st.slider(
+            "top_k",
+            1, 100, 20, 1,
+            help="调整大模型top_k参数",
+            key="top_k",
+            on_change=llm_slider_changed
+        )
+        repetition_penalty = st.slider(
+            "repetition_penalty",
+            1.0, 1.5, 1.1, 0.01,
+            help="调整大模型重复惩罚参数",
+            key="repetition_penalty",
+            on_change=llm_slider_changed
+        )
+        max_history = st.slider(
+            "最大历史",
+            10, 100, 30, 1,
+            help="调整大模型历史最大缓存长度",
+            key="max_history",
             on_change=llm_slider_changed
         )
         # 动态按钮
@@ -120,6 +151,7 @@ with st.sidebar:
         if voice_enabled:
             st.session_state.voice_recognizer.silence_threshold = 1 / st.session_state.voice_sensitivity
 
+
     # 语音识别模块
     with st.expander("🎤 语音设置", expanded=True):
         # 设备选择
@@ -151,10 +183,29 @@ with st.sidebar:
 
     # B站连接模块
     with st.expander("📺 B站连接", expanded=True):
-        bili_room = st.text_input(
-            "直播间ID",
-            placeholder="输入房间号或URL",
-            help="示例：21452505"
+        bili_access_key_id = st.text_input(
+            "ACCESS_KEY_ID",
+            placeholder="输入ACCESS_KEY_ID",
+            value=os.environ.get("ACCESS_KEY_ID"),
+            help="bilibili直播间链接参数"
+        )
+        bili_access_key_secret = st.text_input(
+            "ACCESS_KEY_SECRET",
+            placeholder="输入ACCESS_KEY_SECRET",
+            value=os.environ.get("ACCESS_KEY_SECRET"),
+            help="bilibili直播间链接参数"
+        )
+        bili_app_id = st.text_input(
+            "APP_ID",
+            placeholder="输入APP_ID",
+            value=os.environ.get("APP_ID"),
+            help="bilibili直播间链接参数"
+        )
+        bili_room_auth_code = st.text_input(
+            "ROOM_OWNER_AUTH_CODE",
+            placeholder="输入ROOM_OWNER_AUTH_CODE",
+            value=os.environ.get("ROOM_OWNER_AUTH_CODE"),
+            help="bilibili直播间链接参数"
         )
         # 动态按钮
         if st.session_state.bili_connected:
@@ -167,24 +218,42 @@ with st.sidebar:
             ):
                 # 执行断开操作
                 st.session_state.bili_connected = False
-                st.session_state.bili_room_id = ""
+                # 关闭直播间连接
+                st.session_state.bili_client.stop_client()
                 st.rerun()
         else:
             # 连接按钮
             if st.button(
                     "🟢 立即连接",
                     type="primary",
-                    disabled=not bili_room,
-                    help="连接到指定B站直播间" if bili_room else "请先输入直播间ID",
+                    disabled=not bili_room_auth_code or not bili_access_key_id or not bili_access_key_secret or not bili_app_id,
+                    help="连接到指定B站直播间" if (
+                            bili_room_auth_code and bili_access_key_id and bili_access_key_secret and bili_app_id) else "请先输入直播间连接参数",
                     key="connect_btn"
             ):
                 # 执行连接操作
                 st.session_state.bili_connected = True
-                st.session_state.bili_room_id = bili_room
+                # 初始化直播间连接
+                if st.session_state.bili_client is None:
+                    st.session_state.bili_client = BilibiliClient(
+                        access_key_id=bili_access_key_id,
+                        access_key_secret=bili_access_key_secret,
+                        app_id=int(bili_app_id),
+                        room_owner_id=bili_room_auth_code,
+                        # 绑定大模型管理器
+                        llm_manager=st.session_state.llm_manager
+                    )
+                else:
+                    st.session_state.bili_client.ACCESS_KEY_ID = bili_access_key_id
+                    st.session_state.bili_client.ACCESS_KEY_SECRET = bili_access_key_secret
+                    st.session_state.bili_client.APP_ID = int(bili_app_id)
+                    st.session_state.bili_client.ROOM_OWNER_AUTH_CODE = bili_room_auth_code
+                # 启动直播间连接
+                st.session_state.bili_client.start_client()
                 st.rerun()
 
 # 主界面
-st.title("🎮 高性能机器人助手-天童爱丽丝")
+st.title("🎮 Momotalk-天童爱丽丝")
 st.caption("✨ 由Streamlit提供技术支持 | 🚀 机器人助手控制台 v1.0")
 st.divider()
 
@@ -193,7 +262,7 @@ col1, col2, col3 = st.columns(3)
 with col1:
     st.subheader("🔌 连接状态")
     if st.session_state.bili_connected:
-        st.success("✅ 已连接到直播间：ROOM-" + bili_room)
+        st.success("✅ 已连接到直播间")
     else:
         st.error("❌ 未连接直播平台")
 
@@ -214,15 +283,15 @@ st.divider()
 # 聊天消息容器
 chat_container = st.container()
 
-if voice_enabled:
-    st_autorefresh(interval=200, key="voice_refresh")
+if voice_enabled or st.session_state.bili_connected:
+    st_autorefresh(interval=500, key="voice_refresh")
 
 # 语音输入提示
 text = st.session_state.voice_recognizer.get_latest_text()
 if text:
     # 如果该文本还未处理，则处理并更新消息，然后刷新页面
     if not st.session_state.get("text_processed", False):
-        ai_response = st.session_state.llm_manager.call_llm(prompt=text)
+        ai_response = st.session_state.llm_manager.call_llm(prompt=f"（老师说）{text}")
 
 sensei_avatar = get_image_as_data_uri("avatar/sensei.jpg")
 alice_avatar = get_image_as_data_uri("avatar/happy.png")
@@ -256,7 +325,7 @@ if prompt := st.chat_input("输入消息...", disabled=True if st.session_state.
                 key=f"user_{len(st.session_state.llm_manager.llm.history_display)}")
 
     # AI回复
-    ai_response = st.session_state.llm_manager.call_llm(prompt=prompt)
+    ai_response = st.session_state.llm_manager.call_llm(prompt=f"（老师说）{prompt}")
 
     # 动态更新聊天区域
     with chat_container:
